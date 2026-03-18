@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+agent_config.json
+*.log
+.env
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Blender temp
+*.__read_info__.py
+*.blend1
+*.blend2
+
+# Build artifacts
+build/
+dist/
+
+# Python virtual environment
+.venv/

@@ -1,0 +1,29 @@
+# Render Manager Agent — client-side dependencies
+# Install with: pip install -r requirements-agent.txt
+
+# HTTP client (talks to the server)
+requests>=2.31.0
+
+# Image processing (render preview generation)
+Pillow>=10.0.0
+
+# EXR pass extraction (fast, no Blender needed)
+OpenEXR>=3.2.0
+numpy>=1.24.0
+
+# System tray icon
+pystray>=0.19.0
+
+# Modern dark-themed UI
+customtkinter>=5.2.0
+
+# Windows toast notifications
+plyer>=2.1.0
+
+# Build tool — only needed to compile the .exe, not to run the agent
+pyinstaller>=6.0.0
+
+# Telemetry
+psutil>=5.9.0
+GPUtil>=1.4.0
+
