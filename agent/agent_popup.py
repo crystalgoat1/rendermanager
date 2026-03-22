@@ -164,6 +164,31 @@ def _apply_rounded_corners(root) -> None:
         pass
 
 
+# ── Persistent popup state ────────────────────────────────────────────────────
+# The Tk root + mainloop are kept alive across open/close cycles so that
+# re-opening the popup is instant (no interpreter re-init).
+
+_popup_root = None  # type: ctk.CTk | None
+_popup_visible = threading.Event()   # set = window is on screen
+
+
+def show_existing_popup() -> bool:
+    """If the popup thread is alive, bring the window back.  Returns True if successful."""
+    root = _popup_root
+    if root is None:
+        return False
+    try:
+        root.after(0, root._show_popup)   # post to the Tk mainloop thread
+        return True
+    except Exception:
+        return False
+
+
+def is_popup_alive() -> bool:
+    """True when the popup mainloop is running (even if the window is hidden)."""
+    return _popup_root is not None
+
+
 # ── Main popup ───────────────────────────────────────────────────────────────
 
 def open_tray_popup(
@@ -174,12 +199,14 @@ def open_tray_popup(
     on_quit,
     on_closed=None,
 ):
-    """Create and show the floating dashboard popup. Blocks until closed."""
+    """Create and show the floating dashboard popup. Blocks until closed/quit."""
+    global _popup_root
 
     blend_root  = cfg.get("blend_root",  "")
     output_root = cfg.get("output_root", "")
 
     root = ctk.CTk()
+    _popup_root = root
     root.withdraw()                 # hide before positioning to avoid flash
     root.overrideredirect(True)     # no title bar / window chrome
     root.attributes("-topmost", True)
@@ -190,8 +217,10 @@ def open_tray_popup(
 
     root.configure(fg_color=BG)
 
-    _x, _y = _popup_position(root, POPUP_H_IDLE)
-    root.geometry(f"{POPUP_W}x{POPUP_H_IDLE}+{_x}+{_y}")
+    _initial_has_job = bool(state.get("active_job_id") or state.get("paused_job_id"))
+    _initial_h = POPUP_H_ACTIVE if _initial_has_job else POPUP_H_IDLE
+    _x, _y = _popup_position(root, _initial_h)
+    root.geometry(f"{POPUP_W}x{_initial_h}+{_x}+{_y}")
 
     # ── Border + card wrappers ────────────────────────────────────────────────
     # We use radii that exactly match Windows 11 DWM native corner rounding (8px)
@@ -217,11 +246,17 @@ def open_tray_popup(
         font=ctk.CTkFont(family="Inter", size=14, weight="bold"), text_color=TEXT,
     ).pack(side="left")
 
+    def _hide_popup():
+        _popup_visible.clear()
+        root.withdraw()
+        if on_closed:
+            on_closed()
+
     ctk.CTkButton(
         hdr, text="\u2715", width=26, height=26,
         fg_color="transparent", hover_color="#2a2a4a",
         text_color=MUTED, font=ctk.CTkFont(size=11),
-        corner_radius=6, command=root.destroy,
+        corner_radius=6, command=_hide_popup,
     ).pack(side="right")
 
     def _open_setup():
@@ -298,6 +333,17 @@ def open_tray_popup(
             return
 
         if act_id:
+            # Immediate visual feedback — guard prevents refresh from overwriting
+            _feedback_guard["action"] = "pausing"
+            _feedback_guard["until"] = _time.time() + 10.0
+            status_text_var.set("Pausing...")
+            status_label.configure(text_color=MUTED)
+            pause_btn.configure(state="disabled")
+            # Primary signal: local event — render loop sees this within 0.25s.
+            pause_ev = state.get("pause_event")
+            if pause_ev:
+                pause_ev.set()
+            # Secondary: notify server in background (for DB consistency).
             def _p():
                 try:
                     from .agent_backend import request_job_pause
@@ -306,6 +352,14 @@ def open_tray_popup(
                     pass
             threading.Thread(target=_p, daemon=True).start()
         elif p_id:
+            # Immediate visual feedback — guard prevents refresh from overwriting
+            _feedback_guard["action"] = "resuming"
+            _feedback_guard["until"] = _time.time() + 10.0
+            status_text_var.set("Resuming...")
+            status_label.configure(text_color=WARNING)
+            pause_btn.configure(state="disabled")
+            # Instant: tell job loop to poll immediately
+            state["has_queued_jobs"] = True
             def _r():
                 try:
                     from .agent_backend import request_job_resume
@@ -329,15 +383,23 @@ def open_tray_popup(
         if not job_id:
             return
 
+        # Primary signal: local event — render loop sees this within 0.25s.
+        cancel_ev = state.get("cancel_event")
+        if cancel_ev:
+            cancel_ev.set()
+
+        # Immediate visual feedback — guard prevents refresh from overwriting
+        _feedback_guard["action"] = "cancelling"
+        _feedback_guard["until"] = _time.time() + 10.0
+        status_text_var.set("Cancelling...")
+        status_label.configure(text_color=MUTED)
+        pause_btn.configure(state="disabled")
+
+        # Secondary: notify server in background (for DB consistency).
         def _c():
             try:
                 from .agent_backend import request_job_cancel
                 request_job_cancel(session, job_id, agent_id)
-                if state.get("active_job_id") == job_id:
-                    state["active_job_id"] = None
-                if state.get("paused_job_id") == job_id:
-                    state["paused_job_id"] = None
-                state["status"] = "Canceled"
             except Exception:
                 pass
         threading.Thread(target=_c, daemon=True).start()
@@ -440,17 +502,29 @@ def open_tray_popup(
     footer = ctk.CTkFrame(card, fg_color="transparent")
     footer.pack(fill="x", padx=10, pady=(8, 12))
 
+    def _real_quit():
+        global _popup_root
+        _popup_visible.clear()
+        _popup_root = None
+        root.destroy()
+        on_quit()
+
     ctk.CTkButton(
         footer, text="Quit",
         height=28, corner_radius=6,
         fg_color="transparent", hover_color="#2a0f0f",
         text_color=ERROR, font=ctk.CTkFont(size=11),
-        command=lambda: [root.destroy(), on_quit()],
+        command=_real_quit,
     ).pack(side="right")
 
     # ── Refresh loop ──────────────────────────────────────────────────────────
     _ctrl_shown = [None]   # None = uninitialised; True/False after first refresh
     _update_shown = [False]
+    # When an action button is clicked, we show instant feedback and suppress
+    # the refresh loop from overwriting it until the state actually transitions
+    # or the guard expires (whichever comes first).
+    import time as _time
+    _feedback_guard = {"action": None, "until": 0.0}  # action: "pausing"|"resuming"|"cancelling"
 
     def _set_ctrl_visible(show: bool):
         """Show/hide progress + controls and resize the popup window to fit."""
@@ -485,10 +559,18 @@ def open_tray_popup(
 
     def refresh() -> None:
         if stop_event.is_set():
+            global _popup_root
+            _popup_root = None
+            _popup_visible.clear()
             try:
                 root.destroy()
             except Exception:
                 pass
+            return
+
+        # Still refresh state even when hidden so it's up-to-date on show
+        if not _popup_visible.is_set():
+            root.after(500, refresh)
             return
 
         color = _status_color(state)
@@ -507,10 +589,49 @@ def open_tray_popup(
         p_id   = state.get("paused_job_id")
         filename = state.get("active_filename", "")
 
+        # ── Feedback guard logic ───────────────────────────────────────────
+        # When the user clicks pause/resume/cancel, we show instant feedback
+        # and suppress the refresh loop from overwriting it.  The guard clears
+        # when the underlying state actually transitions (proving the action
+        # took effect) or when the timeout expires (safety net).
+        guard_action = _feedback_guard["action"]
+        guard_active = False
+        if guard_action and _time.time() < _feedback_guard["until"]:
+            # Check if the state has transitioned — if so, clear the guard
+            if guard_action == "pausing" and not act_id:
+                # Transitioned: no longer rendering (paused or cancelled)
+                _feedback_guard["action"] = None
+            elif guard_action == "resuming" and act_id:
+                # Transitioned: resumed and now rendering
+                _feedback_guard["action"] = None
+            elif guard_action == "cancelling" and not act_id and not p_id:
+                # Transitioned: job is gone
+                _feedback_guard["action"] = None
+            else:
+                guard_active = True
+        elif guard_action:
+            # Timeout expired — clear guard so UI returns to normal
+            _feedback_guard["action"] = None
+
         if not state.get("connected", False):
+            # Offline always overrides everything
+            _feedback_guard["action"] = None
             status_text_var.set("Offline \u2014 Reconnecting...")
             status_label.configure(text_color=ERROR)
+            pause_btn.configure(state="normal")
             _set_ctrl_visible(False)
+        elif guard_active:
+            # Guard is active — keep the feedback text, but still update
+            # progress bar and frame counter so the UI doesn't look frozen
+            if act_id:
+                raw_status = state.get("status", "")
+                progress = _parse_progress(raw_status)
+                progress_bar.set(progress)
+                import re
+                m = re.search(r'\((\d+)/(\d+)\)', raw_status)
+                if m:
+                    frame_text_var.set(f"Frame {m.group(1)} of {m.group(2)}")
+            _set_ctrl_visible(True)
         elif act_id:
             status_text_var.set(f"Rendering {filename}" if filename else "Rendering...")
             status_label.configure(text_color=WARNING)
@@ -527,6 +648,7 @@ def open_tray_popup(
                 frame_text_var.set(raw_status)
             pause_var.set("\u23f8 Pause")
             pause_btn.configure(
+                state="normal",
                 fg_color="transparent", hover_color=SURFACE,
                 text_color=MUTED, border_width=1, border_color=BORDER,
             )
@@ -538,6 +660,7 @@ def open_tray_popup(
             frame_text_var.set("")
             pause_var.set("\u25b6 Resume")
             pause_btn.configure(
+                state="normal",
                 fg_color=ACCENT, hover_color=ACCENT_HOVER,
                 text_color="#ffffff", border_width=0, border_color=BORDER,
             )
@@ -545,17 +668,44 @@ def open_tray_popup(
         else:
             status_text_var.set("Ready")
             status_label.configure(text_color=SUCCESS)
+            pause_btn.configure(state="normal")
             _set_ctrl_visible(False)
 
         root.after(500, refresh)
 
-    root.bind("<Escape>", lambda e: root.destroy())
+    def _show_popup_impl():
+        """Reposition, deiconify, and bring to front."""
+        _ctrl_shown[0] = None  # force layout recalculation
+        # Start at the correct height based on current state to avoid
+        # a visible resize flash when a job is active.
+        has_job = bool(state.get("active_job_id") or state.get("paused_job_id"))
+        extra = POPUP_H_UPDATE if _update_shown[0] else 0
+        target_h = (POPUP_H_ACTIVE if has_job else POPUP_H_IDLE) + extra
+        _x, _y = _popup_position(root, target_h)
+        root.geometry(f"{POPUP_W}x{target_h}+{_x}+{_y}")
+        root.deiconify()
+        root.lift()
+        root.focus_force()
+        root.after(60, lambda: _apply_rounded_corners(root))
+        _popup_visible.set()
+
+    # Attach as a method so show_existing_popup() can call it via root.after()
+    root._show_popup = _show_popup_impl
+
+    root.bind("<Escape>", lambda e: _hide_popup())
+
+    # Pre-show controls if a job is already active so there's no expand flash
+    if _initial_has_job:
+        _set_ctrl_visible(True)
+
     root.after(50, root.deiconify)
     root.after(100, lambda: (root.lift(), root.focus_force()))
     root.after(150, lambda: _apply_rounded_corners(root))
     root.after(200, refresh)
+    _popup_visible.set()
 
     root.mainloop()
 
-    if on_closed:
-        on_closed()
+    # mainloop exited — app is shutting down
+    _popup_root = None
+    _popup_visible.clear()

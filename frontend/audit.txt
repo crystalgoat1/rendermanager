@@ -1,0 +1,25 @@
+﻿# npm audit report
+
+esbuild  <=0.24.2
+Severity: moderate
+esbuild enables any website to send any requests to the development server and read the response - https://github.com/advisories/GHSA-67mh-4wv8-2f99
+fix available via `npm audit fix --force`
+Will install vite@7.3.1, which is a breaking change
+node_modules/esbuild
+  vite  0.11.0 - 6.1.6
+  Depends on vulnerable versions of esbuild
+  node_modules/vite
+
+rollup  4.0.0 - 4.58.0
+Severity: high
+Rollup 4 has Arbitrary File Write via Path Traversal - https://github.com/advisories/GHSA-mw96-cpmx-2vgc
+fix available via `npm audit fix`
+node_modules/rollup
+
+3 vulnerabilities (2 moderate, 1 high)
+
+To address issues that do not require attention, run:
+  npm audit fix
+
+To address all issues (including breaking changes), run:
+  npm audit fix --force

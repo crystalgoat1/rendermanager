@@ -1,7 +1,9 @@
 import os
+import queue
 import re
 import subprocess
 import tempfile
+import threading
 import time
 import sys
 from pathlib import Path
@@ -9,7 +11,7 @@ from typing import Optional
 
 from .agent_backend import (
     BackendSession, get_job_control, send_progress, notify_paused, notify_canceled,
-    preload_preview_pass, report_available_passes
+    preload_preview_pass, upload_latest_preview, report_available_passes
 )
 from .agent_notify import notify_render_complete, notify_render_failed, notify_disconnected
 from .agent_override import validate_overrides, generate_override_script
@@ -261,12 +263,31 @@ def make_output_dir_for_job(output_root: str, blend_file_path: str, job_group_id
 
 
 def _stop_proc(proc: subprocess.Popen):
+    """Forcefully kill the Blender process tree.
+
+    On Windows, ``proc.terminate()`` only sends CTRL_BREAK to the direct
+    child.  Blender spawns sub-processes (e.g. OptiX denoiser, USD
+    hydra) that survive the parent termination, leaving orphan GPU
+    processes.  ``taskkill /F /T`` kills the entire tree instantly.
+    """
+    pid = proc.pid
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
     try:
-        proc.terminate()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=3)
+        proc.wait(timeout=5)
     except Exception:
         try:
             proc.kill()
@@ -294,6 +315,8 @@ def _render_range_single_process(
         original_total: Optional[int] = None,
         stop_event=None,
         output_collector: Optional[list] = None,
+        pause_event=None,
+        cancel_event=None,
 ):
     command = [
         blender_path,
@@ -334,11 +357,12 @@ def _render_range_single_process(
         creationflags=creationflags
     )
 
-    last_control_check = 0.0
     remaining_frames = (frame_end - frame_start) + 1
     total_frames = original_total if original_total is not None else remaining_frames
     rendered_frames = already_rendered
     last_counted_frame = None
+
+    _last_server_progress = [0.0]  # mutable container for closure
 
     def push_progress(message: str, cur_frame: Optional[int] = None):
         # Report progress relative to THIS session's work (0-100% of the
@@ -349,49 +373,83 @@ def _render_range_single_process(
         pct = int(min(99.0, (float(session_done) / float(max(1, remaining_frames))) * 100.0))
         if progress_cb:
             progress_cb(pct, message, cur_frame)
-        try:
-            send_progress(session, job_id, agent_id, pct, message, current_frame=cur_frame)
-        except Exception:
-            pass
+        # Throttle server progress updates to every 3s — the dashboard uses
+        # Supabase realtime so sub-second updates are wasted egress.
+        # Always send the first update (pct==0) and completion (pct>=99).
+        now = time.time()
+        if pct >= 99 or pct == 0 or (now - _last_server_progress[0]) >= 3.0:
+            _last_server_progress[0] = now
+            try:
+                send_progress(session, job_id, agent_id, pct, message, current_frame=cur_frame)
+            except Exception:
+                pass
 
     if original_total and original_total > remaining_frames:
         push_progress(f"Rendering frame {frame_start} ({rendered_frames + 1}/{total_frames})")
     else:
         push_progress(f"Blender started (frames {frame_start}-{frame_end})")
 
+    # ------------------------------------------------------------------
+    # Read stdout in a background thread so that control-signal checks
+    # are never blocked waiting for Blender to produce output.
+    # ------------------------------------------------------------------
+    line_queue: queue.Queue[Optional[str]] = queue.Queue()
+
+    def _reader():
+        try:
+            if proc.stdout:
+                for raw_line in proc.stdout:
+                    line_queue.put(raw_line)
+        except Exception:
+            pass
+        finally:
+            line_queue.put(None)  # sentinel: stream ended
+
+    reader_thread = threading.Thread(target=_reader, daemon=True)
+    reader_thread.start()
+
     try:
-        if proc.stdout:
-            for line in proc.stdout:
-                line = (line or "").strip()
-                if line:
-                    try:
-                        print("[blender]", line)
-                    except UnicodeEncodeError:
-                        # Windows cp1252 can't handle emoji/special chars from addons
-                        print("[blender]", line.encode("ascii", errors="replace").decode())
-                    if output_collector is not None:
-                        output_collector.append(line)
-                        if len(output_collector) > 200:
-                            output_collector.pop(0)
+        last_control_check = 0.0
+        stream_ended = False
 
-                now = time.time()
-                if now - last_control_check >= 1.0:
-                    last_control_check = now
-                    try:
-                        ctrl = get_job_control(session, job_id, agent_id)
-                    except Exception:
-                        ctrl = {"pause": False, "cancel": False}
+        while not stream_ended:
+            # Drain all available lines (non-blocking after the first
+            # blocking wait of up to 0.25 s).  Short timeout so local
+            # pause/cancel events are detected within a quarter-second.
+            lines_batch: list[str] = []
+            try:
+                item = line_queue.get(timeout=0.25)
+                if item is None:
+                    stream_ended = True
+                else:
+                    lines_batch.append(item)
+            except queue.Empty:
+                pass
 
-                    if ctrl.get("cancel"):
-                        _stop_proc(proc)
-                        raise CancelRequested("cancel requested")
-                    if ctrl.get("pause"):
-                        _stop_proc(proc)
-                        raise PauseRequested("pause requested")
-                
-                if stop_event and stop_event.is_set():
-                    _stop_proc(proc)
-                    raise RuntimeError("Agent shutdown requested")
+            # Grab any extra lines that are already queued
+            while True:
+                try:
+                    item = line_queue.get_nowait()
+                    if item is None:
+                        stream_ended = True
+                        break
+                    lines_batch.append(item)
+                except queue.Empty:
+                    break
+
+            # --- Process collected lines ---------------------------------
+            for raw_line in lines_batch:
+                line = (raw_line or "").strip()
+                if not line:
+                    continue
+                try:
+                    print("[blender]", line)
+                except UnicodeEncodeError:
+                    print("[blender]", line.encode("ascii", errors="replace").decode())
+                if output_collector is not None:
+                    output_collector.append(line)
+                    if len(output_collector) > 200:
+                        output_collector.pop(0)
 
                 m = SAVED_RE.search(line)
                 if m:
@@ -407,19 +465,50 @@ def _render_range_single_process(
                         basename = os.path.basename(saved_path)
                         if not basename.startswith("render_"):
                             continue
-                            
+
                         basename_noext = os.path.splitext(basename)[0]
                         m_frame = re.search(r"(\d+)$", basename_noext)
                         frame_num = int(m_frame.group(1)) if m_frame else None
-                        
+
                         if frame_num is not None:
                             if frame_num != last_counted_frame:
                                 last_counted_frame = frame_num
                                 rendered_frames = min(total_frames, rendered_frames + 1)
                                 push_progress(f"Saved frame ({rendered_frames}/{total_frames})", cur_frame=frame_num)
-                            
+
                         if on_frame_saved and frame_num is not None:
                             on_frame_saved(frame_num, saved_path)
+
+            # --- Check control signals -----------------------------------
+            # Local events (set by popup in same process) are checked every
+            # loop iteration — zero latency.  The server poll is a fallback
+            # for signals that arrive from the web dashboard.
+            if cancel_event and cancel_event.is_set():
+                _stop_proc(proc)
+                raise CancelRequested("cancel requested (local)")
+            if pause_event and pause_event.is_set():
+                _stop_proc(proc)
+                raise PauseRequested("pause requested (local)")
+
+            now = time.time()
+            if now - last_control_check >= 3.0:
+                last_control_check = now
+                try:
+                    ctrl = get_job_control(session, job_id, agent_id)
+                except Exception as e:
+                    print(f"[render] Control check failed: {e}")
+                    ctrl = {"pause": False, "cancel": False}
+
+                if ctrl.get("cancel"):
+                    _stop_proc(proc)
+                    raise CancelRequested("cancel requested")
+                if ctrl.get("pause"):
+                    _stop_proc(proc)
+                    raise PauseRequested("pause requested")
+
+            if stop_event and stop_event.is_set():
+                _stop_proc(proc)
+                raise RuntimeError("Agent shutdown requested")
 
         rc = proc.wait()
         last_expected = find_frame_file(output_pattern, frame_end)
@@ -432,10 +521,12 @@ def _render_range_single_process(
                 proc.stdout.close()
         except Exception:
             pass
+        reader_thread.join(timeout=3)
 
 
 def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
-                stop_event=None, progress_cb=None, vram_recovery_enabled: bool = False) -> dict:
+                stop_event=None, progress_cb=None, vram_recovery_enabled: bool = False,
+                pause_event=None, cancel_event=None, state=None) -> dict:
     job = validate_and_sanitize_job(job)
 
     job_id = job.get("job_id", "")
@@ -486,20 +577,76 @@ def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
     job_out_dir = make_output_dir_for_job(output_root, blend_file, job_group_id)
     output_pattern = os.path.join(job_out_dir, "render_####")
 
+    # -- Preview upload buffering ------------------------------------------
+    # When the user is not on the dashboard, we buffer preview uploads
+    # and flush them in batches to reduce egress.
+    _preview_buffer: list[dict] = []
+    _buffer_lock = threading.Lock()
+    _batch_stop = threading.Event()
+
+    def _flush_preview_buffer():
+        """Upload all buffered previews."""
+        with _buffer_lock:
+            batch = list(_preview_buffer)
+            _preview_buffer.clear()
+        for item in batch:
+            path = item.get("path")
+            if path and os.path.isfile(path):
+                try:
+                    preload_preview_pass(session, agent_id, job_id, item["frame"], "Combined", path)
+                except Exception:
+                    pass
+            if len(item.get("passes", [])) > 1:
+                try:
+                    report_available_passes(session, agent_id, job_id, item["passes"])
+                except Exception:
+                    pass
+
+    def _batch_upload_loop():
+        """Runs in background — flushes buffered previews every 30 s or
+        immediately when the user becomes active."""
+        last_flush = time.time()
+        while not _batch_stop.is_set():
+            _batch_stop.wait(5)
+            if _batch_stop.is_set():
+                break
+            user_active = (state or {}).get("user_active", False)
+            elapsed = time.time() - last_flush
+            if (user_active or elapsed >= 30) and _preview_buffer:
+                _flush_preview_buffer()
+                last_flush = time.time()
+
     def _on_cached_callback(res_dict: dict):
         frame_num = res_dict["frame"]
         passes = res_dict["passes"]
         files = res_dict.get("files", {})
-
         combined_path = files.get("Combined")
-        if combined_path:
-            preload_preview_pass(session, agent_id, job_id, frame_num, "Combined", combined_path)
 
-        if len(passes) > 1:
-            try:
-                report_available_passes(session, agent_id, job_id, passes)
-            except Exception:
-                pass
+        user_active = (state or {}).get("user_active", True)
+        tier = (state or {}).get("tier", "free")
+
+        # Always update the job's latest preview so the dashboard card
+        # shows a thumbnail immediately (instead of 404 → on-demand fallback).
+        if combined_path:
+            upload_latest_preview(session, job_id, agent_id, combined_path, frame_num)
+
+        if user_active:
+            # Immediate upload — user is watching
+            if combined_path:
+                preload_preview_pass(session, agent_id, job_id, frame_num, "Combined", combined_path)
+            if len(passes) > 1:
+                try:
+                    report_available_passes(session, agent_id, job_id, passes)
+                except Exception:
+                    pass
+        elif tier == "pro":
+            # Pro: buffer for batch upload every ~30 s
+            with _buffer_lock:
+                _preview_buffer.append({"frame": frame_num, "path": combined_path, "passes": passes})
+        # Free + inactive → skip (next frame when user opens dashboard will upload)
+
+    batch_thread = threading.Thread(target=_batch_upload_loop, daemon=True, name="preview-batch")
+    batch_thread.start()
 
     updater = LatestFrameUpdater(workspace_root, job_id, blender_path, on_cached_callback=_on_cached_callback)
     updater.start()
@@ -509,6 +656,7 @@ def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
 
     resume_start = find_first_missing_frame(output_pattern, fs_val, fe_val)
     if resume_start > fe_val:
+        _batch_stop.set()
         updater.stop()
         cleanup_latest(workspace_root, job_id)
         send_progress(session, job_id, agent_id, 100, "All frames already rendered", current_frame=fe_val)
@@ -521,7 +669,8 @@ def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
         current_fs = fs_val
 
     try:
-        send_progress(session, job_id, agent_id, 0, f"Output folder: {job_out_dir}")
+        # Only send the folder name, not the full absolute path (privacy)
+        send_progress(session, job_id, agent_id, 0, f"Output folder: {os.path.basename(job_out_dir)}")
     except Exception:
         pass
 
@@ -565,6 +714,8 @@ def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
                 already_rendered=current_fs - fs_val,
                 original_total=(fe_val - fs_val) + 1,
                 stop_event=stop_event,
+                pause_event=pause_event,
+                cancel_event=cancel_event,
             )
         else:
             _render_range_single_process(
@@ -586,6 +737,8 @@ def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
                 already_rendered=current_fs - fs_val,
                 original_total=(fe_val - fs_val) + 1,
                 stop_event=stop_event,
+                pause_event=pause_event,
+                cancel_event=cancel_event,
             )
 
         cached = get_latest_cached(workspace_root, job_id)
@@ -603,7 +756,12 @@ def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
         return result
 
     except PauseRequested:
-        notify_paused(session, job_id, agent_id)
+        resp = notify_paused(session, job_id, agent_id)
+        # If cancel was requested while we were pausing, the server
+        # cancels instead of pausing and tells us.  Honour that so the
+        # job_loop doesn't enter the stale paused-job wait loop.
+        if isinstance(resp, dict) and resp.get("status") == "canceled":
+            return {"status": "canceled"}
         return {"status": "paused"}
 
     except CancelRequested:
@@ -611,6 +769,9 @@ def process_job(cfg: dict, session: BackendSession, agent_id: str, job: dict,
         return {"status": "canceled"}
 
     finally:
+        # Stop the batch upload loop and flush any remaining buffered previews
+        _batch_stop.set()
+        _flush_preview_buffer()
         updater.stop()
         cleanup_latest(workspace_root, job_id)
         if override_script:
@@ -639,6 +800,8 @@ def _render_with_vram_recovery(
         already_rendered: int = 0,
         original_total: Optional[int] = None,
         stop_event=None,
+        pause_event=None,
+        cancel_event=None,
 ) -> dict:
     total_frames = original_total or (frame_end - frame_start + 1)
     remaining_frames = (frame_end - frame_start) + 1
@@ -708,6 +871,8 @@ def _render_with_vram_recovery(
                     original_total=total_frames,
                     stop_event=stop_event,
                     output_collector=output_collector,
+                    pause_event=pause_event,
+                    cancel_event=cancel_event,
                 )
 
                 frame_succeeded = True

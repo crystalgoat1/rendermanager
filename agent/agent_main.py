@@ -31,6 +31,7 @@ from agent.agent_notify import notify_render_complete, notify_render_failed, not
 
 HEARTBEAT_IDLE_SECONDS = 15
 HEARTBEAT_ACTIVE_SECONDS = 10
+HEARTBEAT_SLOW_SECONDS = 45    # user inactive, no render
 JOB_POLL_SECONDS = 3
 PREVIEW_POLL_SECONDS = 5
 BOOT_ID = str(uuid.uuid4())
@@ -126,23 +127,29 @@ def heartbeat_loop(
     backoff = 1.0
     consecutive_403s = 0
     while not stop_event.is_set():
-        # Kick off telemetry collection in background (hard 5s cap).
-        # The heartbeat will always send — with stale/empty telemetry if needed.
-        tele_thread = threading.Thread(target=_refresh_telemetry, daemon=True, name="telemetry")
-        tele_thread.start()
-        tele_thread.join(timeout=5.0)
-        # Don't wait longer — use whatever we have cached.
+        # Only collect + send telemetry when someone might be looking at it
+        # (rendering or user on dashboard).  Saves ~300 bytes per idle heartbeat.
+        _should_telemetry = bool(state.get("active_job_id") or state.get("user_active"))
+        if _should_telemetry:
+            tele_thread = threading.Thread(target=_refresh_telemetry, daemon=True, name="telemetry")
+            tele_thread.start()
+            tele_thread.join(timeout=5.0)
 
         try:
             hb_start = time.time()
-            resp = send_heartbeat(session, agent_id, BOOT_ID, telemetry=_cached_telemetry or None)
+            _tele = _cached_telemetry if _should_telemetry else None
+            resp = send_heartbeat(session, agent_id, BOOT_ID, telemetry=_tele)
             hb_elapsed = time.time() - hb_start
             if resp and resp.get("update_available"):
                 state["update_available"] = True
                 state["latest_version"] = resp.get("latest_version", "")
             # Propagate polling signals from server so other loops can skip HTTP calls
             state["has_queued_jobs"] = bool(resp.get("has_queued_jobs"))
+            state["has_paused_jobs"] = bool(resp.get("has_paused_jobs"))
             state["has_preview_tasks"] = bool(resp.get("has_preview_tasks"))
+            state["user_active"] = bool(resp.get("user_active"))
+            if resp.get("tier"):
+                state["tier"] = resp["tier"]
             if resp.get("rescan_requested"):
                 state["rescan_requested"] = True
             was_disconnected = not state["connected"]
@@ -186,8 +193,16 @@ def heartbeat_loop(
             if was_connected:
                 notify_disconnected()
 
-        is_active = bool(state.get("active_job_id") or state.get("has_queued_jobs"))
-        interval = HEARTBEAT_ACTIVE_SECONDS if is_active else HEARTBEAT_IDLE_SECONDS
+        is_rendering = bool(state.get("active_job_id"))
+        has_queued = bool(state.get("has_queued_jobs"))
+        user_active = bool(state.get("user_active"))
+
+        if is_rendering or has_queued:
+            interval = HEARTBEAT_ACTIVE_SECONDS     # 10s
+        elif user_active:
+            interval = HEARTBEAT_IDLE_SECONDS       # 15s
+        else:
+            interval = HEARTBEAT_SLOW_SECONDS       # 30s
         stop_event.wait(max(float(interval), backoff))
 
 
@@ -211,6 +226,25 @@ def job_loop(
         # us the targeted/resumed job thanks to target_agent_id, so we won't
         # accidentally pick up a different one.
         if state.get("paused_job_id"):
+            # Check if the user cancelled the paused job locally (popup button).
+            if state.get("cancel_event") and state["cancel_event"].is_set():
+                paused_jid = state["paused_job_id"]
+                state["paused_job_id"] = None
+                state["active_filename"] = None
+                state["cancel_event"].clear()
+                state["status"] = "Ready"
+                print(f"[job_loop] Paused job {paused_jid} cancelled locally")
+                continue
+            # Check if the paused job was cancelled from the web dashboard.
+            # The heartbeat tells us whether any paused jobs exist on the
+            # server.  If not, our paused_job_id is stale (cancelled/deleted).
+            if not state.get("has_paused_jobs"):
+                paused_jid = state["paused_job_id"]
+                state["paused_job_id"] = None
+                state["active_filename"] = None
+                state["status"] = "Ready"
+                print(f"[job_loop] Paused job {paused_jid} no longer exists on server (cancelled from web?)")
+                continue
             if not state.get("has_queued_jobs"):
                 state["status"] = f"Paused: {state.get('active_filename', 'job')}"
                 stop_event.wait(0.5)
@@ -220,11 +254,21 @@ def job_loop(
 
         # Skip the HTTP call when the heartbeat says no jobs are queued.
         # This is the single biggest egress saver for idle agents.
+        # Exception: when user is active on the dashboard, poll every ~5 s
+        # as a fallback so newly-created jobs are picked up quickly without
+        # waiting for the next heartbeat cycle.
         if not state.get("has_queued_jobs"):
-            state["status"] = "Idle"
-            # Check frequently so we react fast when heartbeat flips the flag
-            stop_event.wait(0.5)
-            continue
+            user_active = state.get("user_active", False)
+            if user_active:
+                # User is on dashboard — poll at normal cadence so new
+                # jobs start within a few seconds of creation.
+                state["status"] = "Idle"
+                stop_event.wait(JOB_POLL_SECONDS)
+                # Fall through to the next-job HTTP call below
+            else:
+                state["status"] = "Idle"
+                stop_event.wait(0.5)
+                continue
 
         try:
             state["status"] = "Polling for jobs..."
@@ -243,6 +287,18 @@ def job_loop(
             vram_recovery = resp.get("vram_recovery_enabled", False)
 
             job_id = job.get("job_id")
+
+            # If we still have a stale paused_job_id but the server gave us
+            # a different job, the paused job was likely cancelled from the
+            # dashboard.  Clear the stale state and accept the new job —
+            # the server already claimed it (set to in_progress), so
+            # rejecting it would leave it stuck forever.
+            paused_id = state.get("paused_job_id")
+            if paused_id and job_id != paused_id:
+                print(f"[job_loop] Clearing stale paused_job_id {paused_id}, accepting new job {job_id}")
+                state["paused_job_id"] = None
+                state["has_paused_jobs"] = False
+
             blend_relpath = job.get("blend_relpath", "")
             filename = os.path.basename(blend_relpath) if blend_relpath else f"job {job_id[:8]}"
             state["active_job_id"] = job_id
@@ -251,9 +307,21 @@ def job_loop(
             state["status"] = f"Rendering {filename}"
 
             try:
+                # Clear any stale local control signals from a previous job
+                state["pause_event"].clear()
+                state["cancel_event"].clear()
+
                 def _on_prog(pct, msg, cur_frame):
                     state["status"] = msg
-                result = process_job(cfg, session, agent_id, job, stop_event=stop_event, progress_cb=_on_prog, vram_recovery_enabled=vram_recovery)
+                result = process_job(
+                    cfg, session, agent_id, job,
+                    stop_event=stop_event,
+                    progress_cb=_on_prog,
+                    vram_recovery_enabled=vram_recovery,
+                    pause_event=state["pause_event"],
+                    cancel_event=state["cancel_event"],
+                    state=state,
+                )
                 state["active_job_id"] = None
 
                 # process_job returns a dict: {"status": "completed", "vram_recovery": {...}}
@@ -269,6 +337,7 @@ def job_loop(
                 elif result_status == "paused":
                     state["status"] = f"Paused: {filename}"
                     state["paused_job_id"] = job_id
+                    state["has_paused_jobs"] = True  # prevent race with heartbeat
                 elif result_status == "canceled":
                     state["status"] = f"Canceled: {filename}"
                     state["active_filename"] = None
@@ -321,6 +390,13 @@ def preview_task_loop(
     while not stop_event.is_set():
         has_tasks = state.get("has_preview_tasks")
         is_rendering = bool(state.get("active_job_id"))
+        user_active = bool(state.get("user_active"))
+
+        # Skip polling entirely when nobody is watching and nothing to do
+        if not user_active and not is_rendering and not has_tasks:
+            stop_event.wait(PREVIEW_IDLE_SECONDS)
+            continue
+
         if has_tasks:
             interval = PREVIEW_POLL_SECONDS  # 5s — fast, tasks waiting
         elif is_rendering:
@@ -732,6 +808,11 @@ def _run_agent_loop_inner(cfg: dict):
     if "enabled" in cfg and not cfg["enabled"]:
         print("[agent] Ignoring legacy 'enabled: false' config field. Agent now always runs when started.")
 
+    # Local control events — set by the popup directly so pause/cancel is
+    # instant without waiting for an HTTP server round-trip.
+    pause_event  = threading.Event()
+    cancel_event = threading.Event()
+
     state = {
         "status": "Starting...",
         "connected": False,
@@ -744,7 +825,14 @@ def _run_agent_loop_inner(cfg: dict):
         "paused_job_id": None,
         "session": session,
         "has_queued_jobs": False,
+        "has_paused_jobs": False,
         "has_preview_tasks": False,
+        # Local control signals (same-process, zero-latency)
+        "pause_event":  pause_event,
+        "cancel_event": cancel_event,
+        # User presence — set by heartbeat, controls polling frequency
+        "user_active": False,
+        "tier": "free",
     }
 
     # Register agent (may fail if server is down; caller decides what to do)
@@ -870,6 +958,7 @@ def main():
     parser.add_argument("--autostart", action="store_true", help="Started by Windows Task Scheduler")
     parser.add_argument("--uninstall-addon", action="store_true", help="Uninstall the Blender addon from all discovered Blender versions in AppData")
     parser.add_argument("--config", type=str, default="", help="Path to agent_config.json")
+    parser.add_argument("--silent", action="store_true", help="Suppress startup toast (used when launched from setup wizard)")
     args = parser.parse_args()
 
     if args.uninstall_addon:
@@ -968,7 +1057,7 @@ def main():
             ok, reason = validate_config_for_mvp(cfg)
             if not ok:
                 raise SystemExit(f"Invalid config: {reason}")
-            run_agent_loop(cfg, prompt_success=True)
+            run_agent_loop(cfg, prompt_success=not args.silent)
             return
 
         # No explicit config path — load or create default config.

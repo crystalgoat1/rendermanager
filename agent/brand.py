@@ -10,4 +10,4 @@ APP_MODEL_ID = "AntiGravity.RenderManager.Agent.1"  # Windows app model ID
 APP_TASK_NAME = "RenderManager"  # Windows Task Scheduler task name
 APP_EXE_NAME = "RenderManager.exe"  # Built executable name
 APP_DEFAULT_WORKSPACE = "RenderManagerWorkspace"  # Default workspace folder name
-AGENT_VERSION = "1.1.4"
+AGENT_VERSION = "1.1.5"

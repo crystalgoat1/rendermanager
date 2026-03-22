@@ -167,8 +167,19 @@ class TrayApp:
 
     def _on_left_click(self, *_):
         """Open the floating popup panel above the tray icon."""
+        try:
+            from .agent_popup import is_popup_alive, show_existing_popup
+
+            # If the popup window exists (hidden), just bring it back instantly
+            if is_popup_alive():
+                if show_existing_popup():
+                    return
+        except Exception as e:
+            print(f"[tray] show_existing_popup failed: {e}")
+
+        # Otherwise create a new one (first click, or after quit/crash)
         if self._dashboard_thread and self._dashboard_thread.is_alive():
-            return  # popup already open
+            return
         self._dashboard_thread = threading.Thread(
             target=self._run_popup, daemon=True, name="popup",
         )
@@ -183,16 +194,11 @@ class TrayApp:
                 active_event=self.active_event,
                 stop_event=self.stop_event,
                 on_quit=self._quit,
-                on_closed=self._on_popup_closed,
             )
         except Exception as e:
             print(f"[tray] Popup failed: {e}")
         finally:
             self._dashboard_thread = None
-
-    def _on_popup_closed(self) -> None:
-        """Called when the popup window closes — resets the thread reference."""
-        self._dashboard_thread = None
 
     def _toggle_paused(self):
         if self.active_event.is_set():

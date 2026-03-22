@@ -773,23 +773,6 @@ def run_setup_wizard(
     btn_addon.configure(command=do_install_addon)
     _update_addon_ui()
 
-    # ---- Start with Windows Row ----
-    from .agent_service import is_autostart_enabled
-    autostart_row = ctk.CTkFrame(card, fg_color="transparent")
-    autostart_row.pack(fill="x", padx=20, pady=(10, 0))
-
-    ctk.CTkLabel(autostart_row, text="Start with Windows", width=110, anchor="w",
-                 font=ctk.CTkFont(family="Inter", size=13, weight="bold"), text_color=TEXT).pack(side="left")
-
-    autostart_var = tk.BooleanVar(value=is_autostart_enabled() if existing_config_path else True)
-    autostart_switch = ctk.CTkSwitch(
-        autostart_row, text="", variable=autostart_var,
-        onvalue=True, offvalue=False, width=46,
-        progress_color=ACCENT, button_color=TEXT, button_hover_color="#d1d5db",
-        fg_color=BORDER,
-    )
-    autostart_switch.pack(side="left", padx=(8, 0))
-
     # Init auth UI state
     _update_auth_ui()
 
@@ -817,7 +800,7 @@ def run_setup_wizard(
             "blend_root":     os.path.join(workspace, "BlendFiles"),
             "output_root":    os.path.join(workspace, "Renders"),
             "config_path":    cfg_path,
-            "autostart":      autostart_var.get(),
+            "autostart":      True,
         }
 
     def validate_local() -> tuple[bool, str]:
@@ -843,11 +826,8 @@ def run_setup_wizard(
             _copy_example_blend(cfg["blend_root"])
 
             try:
-                from .agent_service import enable_autostart, disable_autostart
-                if cfg["autostart"]:
-                    enable_autostart()
-                else:
-                    disable_autostart()
+                from .agent_service import enable_autostart
+                enable_autostart()
             except Exception as exc:
                 print(f"[setup] Autostart registration failed: {exc}")
 
@@ -859,7 +839,7 @@ def run_setup_wizard(
                     if sys.platform == "win32":
                         flags |= subprocess.CREATE_NO_WINDOW
                     subprocess.Popen(
-                        [sys.executable, "--run", "--config", cfg_path],
+                        [sys.executable, "--run", "--config", cfg_path, "--silent"],
                         creationflags=flags
                     )
                 else:
@@ -868,7 +848,7 @@ def run_setup_wizard(
                     if sys.platform == "win32":
                         flags |= subprocess.CREATE_NO_WINDOW
                     subprocess.Popen(
-                        [sys.executable, "agent_entry.py", "--run", "--config", cfg_path],
+                        [sys.executable, "agent_entry.py", "--run", "--config", cfg_path, "--silent"],
                         cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         creationflags=flags
                     )

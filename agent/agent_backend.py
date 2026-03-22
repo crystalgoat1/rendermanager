@@ -244,3 +244,26 @@ def preload_preview_pass(
     except Exception as e:
         print(f"[preview] Preload failed for pass '{pass_name}': {e}")
     return False
+
+
+def upload_latest_preview(
+    session: BackendSession, job_id: str, agent_id: str,
+    file_path: str, frame: int, pass_name: str = "Combined",
+):
+    """Upload a JPEG as the job's latest preview (shown on the dashboard card)."""
+    try:
+        with open(file_path, "rb") as f:
+            res = session.post(
+                f"/jobs/{job_id}/preview/latest",
+                files={"file": (os.path.basename(file_path), f, "image/jpeg")},
+                data={"agent_id": agent_id, "frame": str(frame), "pass_name": pass_name},
+                timeout=60,
+            )
+        if res.status_code == 200:
+            return True
+        # 429 = rate limited, not an error worth logging loudly
+        if res.status_code != 429:
+            print(f"[preview] Latest preview upload failed: {res.text}")
+    except Exception as e:
+        print(f"[preview] Latest preview upload failed: {e}")
+    return False

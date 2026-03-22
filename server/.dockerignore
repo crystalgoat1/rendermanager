@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+temp_previews/
+preview_storage/
+test_*.py

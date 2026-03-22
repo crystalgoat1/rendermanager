@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --color-primary: #6366f1;
+    --color-secondary: #0ea5e9;
+  }
+  html {
+    font-family: 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+}
+
+@layer utilities {
+  /* Brand gradient — used on hero CTAs, logo placeholder, and Pro badges ONLY */
+  .gradient-primary {
+    background: linear-gradient(135deg, #6366f1 0%, #0ea5e9 100%);
+  }
+  /* Gradient text — hero headline accent, step numbers */
+  .text-gradient {
+    background: linear-gradient(135deg, #6366f1 0%, #0ea5e9 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  /* Pro pricing card glow — the ONE place a brand-colored shadow lives */
+  .glow-border {
+    box-shadow: 0 0 20px rgba(99, 102, 241, 0.15);
+  }
+  /* Hide scrollbar while keeping scroll functionality */
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  /* Hide number input spinners */
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type="number"] { -moz-appearance: textfield; }
+
+  /* Custom thin dark scrollbar for JobSettingsModal */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+  }
+}
